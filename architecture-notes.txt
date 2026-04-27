@@ -1,0 +1,398 @@
+========================================================
+ CONTENT BROADCASTING SYSTEM — ARCHITECTURE NOTES
+========================================================
+
+1. AUTHENTICATION & RBAC FLOW
+-------------------------------
+JWT (JSON Web Tokens) are used for stateless, horizontally scalable authentication.
+
+Token lifecycle:
+  - POST /auth/register or /auth/login → server signs a JWT containing { id, role }
+    with HS256 and the JWT_SECRET from .env. Token expiry defaults to 7 days.
+  - Client stores the token and sends it as:
+      Authorization: Bearer <token>
+  - The `authenticate` middleware intercepts every protected request:
+      1. Extracts the token from the Authorization header.
+      2. Verifies signature and expiry with jsonwebtoken.verify().
+      3. Decodes the payload to get { id, role }.
+      4. Fetches the user row from MySQL to confirm they still exist and is_active = TRUE.
+         (This single extra query guards against deactivated accounts using old tokens.)
+      5. Attaches the user object to req.user for downstream handlers.
+
+Role enforcement:
+  - The `authorize(...roles)` middleware checks req.user.role against the allowed set.
+  - Pre-built shortcuts used across routes:
+      principalOnly = authorize('principal')
+      teacherOnly   = authorize('teacher')
+      staffOnly     = authorize('principal', 'teacher')
+  - Public routes (/content/live/:teacher, /auth/login, /auth/register) skip authenticate
+    entirely — they are not mounted behind the middleware.
+
+Password security:
+  - Passwords are hashed with bcrypt at cost factor 12 before storage.
+  - Plain-text passwords are never logged, stored, or returned in any response.
+  - password_hash is excluded from all user objects returned by the API.
+
+
+2. SUBJECT-BASED SYSTEM DESIGN
+--------------------------------
+Each subject acts as an independent broadcast "channel".
+
+  content_slots table — one row per subject (e.g. maths, science, english).
+    - Created automatically on first upload via ContentSlotModel.findOrCreate().
+    - Pre-seeded with 10 common subjects at startup via seed.js.
+    - The subject name is always normalized to lowercase before storage.
+
+  content_schedule table — links a content item to its subject slot.
+    - Stores rotation_order (position in the queue) and duration (minutes per slot).
+    - rotation_order is auto-incremented: new uploads get MAX(rotation_order) + 1
+      within their subject slot.
+    - UNIQUE KEY on (content_id, slot_id) prevents duplicates.
+    - is_active flag is set to FALSE on rejection or deletion so the item drops
+      out of the rotation without being hard-deleted.
+
+  Subject isolation:
+    - The scheduling engine groups all active content by subject, then runs the
+      rotation algorithm independently for each group.
+    - A teacher's Maths rotation is completely independent of their Science rotation.
+    - Adding or removing items from one subject does not affect any other subject.
+
+
+3. UPLOAD HANDLING APPROACH — TWO-STEP FLOW
+--------------------------------------------
+File upload is a deliberate two-step process: server disk → Cloudinary.
+
+Step 1 — Multer receives and saves to local disk:
+  - Multer is configured with diskStorage, writing files to the /uploads directory
+    on the server's local filesystem.
+  - fileFilter runs before writing: only image/jpeg, image/png, and image/gif are
+    accepted. Other mimetypes are rejected with a 400 error before any disk I/O.
+  - A file size limit of 10 MB is enforced by Multer at the stream level; oversized
+    uploads are aborted mid-transfer.
+  - The local file at this point is a temporary staging artifact.
+
+Step 2 — Controller uploads from disk to Cloudinary:
+  - After Multer completes, the controller calls cloudinary.uploader.upload(file.path)
+    passing the local disk path.
+  - Cloudinary processes and stores the file on its CDN.
+  - Cloudinary returns a secure URL (file_url) and a public_id (cloudinary_public_id).
+  - These two values — and nothing about the local path — are persisted to the database.
+
+Step 3 — Local temp file deleted:
+  - Once Cloudinary confirms the upload, the local file is deleted from disk.
+  - If Cloudinary upload fails, the local file is also cleaned up and the error is
+    surfaced to the client.
+  - At no point does file_path appear in the content table; it is never stored in the DB.
+
+Why two-step instead of streaming directly to Cloudinary?
+  - Gives the server an opportunity to validate file integrity on disk before committing
+    to Cloudinary storage.
+  - Allows pre-processing (resize, strip metadata) in future without changing the API.
+  - Makes it straightforward to switch storage backends (S3, GCS) by changing only the
+    upload step, without touching Multer configuration.
+  - The local /uploads directory acts as a short-lived buffer, not permanent storage.
+
+What IS stored in the database (content table):
+  - file_url           — Cloudinary CDN URL (used by students to view the file)
+  - cloudinary_public_id — used to delete the file from Cloudinary on content removal
+  - file_type          — MIME type (image/jpeg, image/png, image/gif)
+  - file_size          — bytes (from Multer, before upload)
+  - file_original_name — original filename from the client
+
+What is NOT stored:
+  - file_path — the local disk path is ephemeral and deleted after upload; never persisted.
+
+
+4. APPROVAL WORKFLOW DESIGN
+-----------------------------
+Content lifecycle states (content.status ENUM):
+  pending → approved
+  pending → rejected
+
+All uploads enter "pending" automatically. The teacher cannot self-approve.
+
+Principal actions:
+  PATCH /content/:id/approve
+    - Validates status is "pending" (cannot approve already-approved or rejected content).
+    - Sets status = 'approved', approved_by = principal.id, approved_at = NOW().
+    - Clears any previous rejection fields.
+    - Calls invalidateTeacherCache(uploaded_by) to bust the Redis cache for that teacher
+      so the newly approved content can appear in the next broadcast fetch.
+    - Logs to audit_logs.
+
+  PATCH /content/:id/reject
+    - Requires rejection_reason (5–1000 chars); returns 422 if missing.
+    - Sets status = 'rejected', rejection_reason, rejected_by, rejected_at.
+    - Calls ContentScheduleModel.deactivate(contentId) to set is_active = FALSE on the
+      schedule entry — the item will no longer appear in any rotation query.
+    - Calls invalidateTeacherCache(uploaded_by) to bust the Redis cache.
+    - The rejection_reason is visible to the teacher when they fetch their content.
+
+Edge cases:
+  - Attempting to approve/reject a non-pending item returns HTTP 400 with a clear message.
+  - Attempting to approve/reject non-existent content returns HTTP 404.
+  - Teachers cannot see other teachers' content (filtered at query level by uploaded_by).
+
+
+5. SCHEDULING / ROTATION LOGIC
+--------------------------------
+The scheduling engine lives entirely in src/services/scheduling.service.js.
+It is a pure time-based computation — no cron jobs, no timers, no background workers.
+
+Core principle — start-time anchored rotation:
+  Every content item in a subject group has a duration (minutes).
+  The group forms a repeating cycle of total_cycle_ms duration.
+
+  total_cycle_ms = Σ (item.duration × 60 × 1000)   for all items in group
+
+  start_time_ms  = timestamp of the first scheduled content
+  elapsed_ms     = max(0, Date.now() - start_time_ms) % total_cycle_ms
+
+  Walk items in rotation_order ASC, accumulating duration.
+  The item whose running total first exceeds elapsed_ms is the currently active item.
+
+Why start-time anchoring?
+  - The rotation begins exactly when the scheduled content becomes active.
+  - Aligns with real-world scenarios (e.g., class starts at a specific time).
+  - No dependency on server start or request timing.
+  - Stateless computation based only on current time and stored schedule.
+
+Time remaining:
+  time_remaining_ms = (accumulated_ms_at_active_item) - elapsed_ms
+  time_remaining_seconds is included in the response so clients can display a countdown
+  or know when the next content switch will occur.
+
+Gating — content must satisfy ALL of these to be included:
+  1. status = 'approved'
+  2. is_deleted = FALSE
+  3. start_time IS NOT NULL
+  4. end_time IS NOT NULL
+  5. NOW() BETWEEN start_time AND end_time   (MySQL filters this in the query)
+  6. content_schedule.is_active = TRUE
+
+Teacher identifier resolution (/content/live/:identifier):
+  - UUID format   → direct user ID lookup
+  - Unrecognised  → returns { available: false }
+
+getAllLiveContent (principal overview):
+  - Loops all active teachers, runs getLiveContent per teacher.
+  - Not cached — this is a low-traffic admin endpoint.
+
+
+6. REDIS CACHING
+-----------------
+Redis is used exclusively to cache /content/live responses.
+Implementation: src/config/redis.js (redis v4 client).
+
+Connection:
+  - getClient() creates a single shared redis.createClient() instance.
+  - reconnectStrategy retries up to 5 times with exponential back-off (200ms × retries,
+    capped at 2000ms), then stops retrying to avoid infinite reconnect loops.
+  - If Redis never connects, isConnected stays FALSE and all cache operations are no-ops.
+
+Graceful degradation:
+  - cacheGet(), cacheSet(), cacheDel() all wrap their Redis calls in try/catch.
+  - On any error (connection refused, timeout, serialisation failure) they return null
+    or silently return — never throw, never crash the HTTP request.
+  - The application works correctly without Redis; it simply hits MySQL on every request.
+
+Cache keys:
+  live:teacher:<teacherId>                 — no subject filter
+  live:teacher:<teacherId>:sub:<subject>   — subject-filtered request
+
+TTL strategy — slot-boundary expiry:
+  TTL = min(time_remaining_seconds across all active subjects in the response)
+      → floor at 5 seconds  (avoids sub-second micro-caches)
+      → cap  at 300 seconds (5 min safety net for very long durations)
+
+  This means the cache entry auto-expires at the exact moment the active content would
+  change. There is no fixed refresh interval; TTL is always derived from the data itself.
+
+Countdown accuracy from cache:
+  The response payload stores _cached_at_ms (the epoch ms when it was computed).
+  On a cache hit, _refreshTimeRemaining() recomputes:
+    displayed_remaining = stored_remaining - floor((now - _cached_at_ms) / 1000)
+  Students therefore see an accurate live countdown even when served from cache.
+  _cached_at_ms and _min_time_remaining_seconds are internal fields stripped from
+  the final response before sending to the client.
+
+Empty-response caching:
+  When no content is available, the empty response is cached for 10 seconds.
+  This prevents a thundering herd of student requests from hammering MySQL when
+  no content is scheduled.
+
+Cache invalidation — immediate, on write events:
+  invalidateTeacherCache(teacherId) is called in content.service.js:
+    - approveContent()  → new content now eligible; old cache stale
+    - rejectContent()   → content removed from rotation; old cache stale
+    - deleteContent()   → content removed; old cache stale
+
+  invalidateTeacherCache() uses a SCAN + DEL loop to delete all keys matching
+  live:teacher:<teacherId>* (wildcard), covering both the base key and all
+  subject-variant keys in one operation.
+
+
+7. DATABASE DESIGN DECISIONS
+------------------------------
+Engine: MySQL (InnoDB) via mysql2 connection pool (limit: 10 connections).
+
+Primary keys: VARCHAR(36) UUIDs generated with uuid.v4(). UUIDs prevent ID enumeration
+  attacks and make records safe to reference in public URLs.
+
+Soft deletes: content uses is_deleted = TRUE instead of DELETE. This preserves the full
+  audit trail (who uploaded, who approved/rejected) and allows recovery if needed.
+  All queries add AND is_deleted = FALSE to exclude soft-deleted rows.
+
+Indexes:
+  users          → email (login lookup), role (teacher list query)
+  content        → subject, status, uploaded_by, (start_time, end_time) composite
+  content_slots  → subject (unique)
+  content_schedule → slot_id, content_id, rotation_order
+
+Why start_time/end_time on content (not on content_schedule):
+  These are teacher-controlled scheduling fields — they define the broadcast window
+  for a specific piece of content, independent of which rotation slot it occupies.
+  Putting them on the content row simplifies the live-content query (single table scan
+  with a BETWEEN clause) and keeps the teacher's intent co-located with their upload.
+
+file_path NOT stored:
+  Local disk path is a transient staging artifact. Storing it would be misleading
+  (the file is deleted after Cloudinary upload) and would expose internal server
+  paths. Only file_url (CDN URL) and cloudinary_public_id are persisted.
+
+audit_logs.details is JSON:
+  Allows each event type to store arbitrary structured metadata (e.g. rejection reason,
+  subject name, file size) without requiring schema changes per event type.
+
+
+8. FOLDER STRUCTURE
+--------------------
+src/
+├── config/
+│   ├── database.js       — mysql2 connection pool, testConnection()
+│   └── redis.js          — Redis client, cacheGet/cacheSet/cacheDel,
+│                           invalidateTeacherCache()
+├── controllers/
+│   ├── auth.controller.js       — register, login, getProfile
+│   ├── content.controller.js    — upload, my, all, pending, approve, reject,
+│   │                              delete, getLiveContent, getAllLiveContent
+│   └── user.controller.js       — getAllTeachers, getUserById
+├── middlewares/
+│   ├── auth.middleware.js         — authenticate (JWT verify + DB check),
+│   │                               authorize(), principalOnly, teacherOnly, staffOnly
+│   ├── validation.middleware.js   — express-validator rule sets per route
+│   ├── rateLimiter.middleware.js  — generalLimiter, authLimiter, publicBroadcastLimiter
+│   └── errorHandler.middleware.js — centralised error handler + 404 handler
+├── models/
+│   ├── user.model.js             — CRUD for users table
+│   ├── content.model.js          — CRUD + status transitions for content table
+│   ├── contentSlot.model.js      — findBySubject, findOrCreate, findAll
+│   └── contentSchedule.model.js  — upsert, findBySlot, getMaxRotationOrder, deactivate
+├── routes/
+│   ├── index.js          — mounts /auth, /content, /users; health check
+│   ├── auth.routes.js
+│   ├── content.routes.js — public /live/:teacher + all protected content routes
+│   └── user.routes.js
+├── services/
+│   ├── auth.service.js        — register, login, getProfile business logic
+│   ├── content.service.js     — upload, approve, reject, delete + cache invalidation
+│   └── scheduling.service.js  — getLiveContent (with Redis cache), getAllLiveContent,
+│                                 rotation algorithm, teacher resolution
+├── utils/
+│   ├── response.js    — successResponse, errorResponse, paginatedResponse, etc.
+│   ├── jwt.js         — generateToken, verifyToken, decodeToken
+│   ├── cloudinary.js  — Cloudinary SDK config and upload to cloudinary
+│   ├── pagination.js  — getPagination, buildPaginationMeta
+│   ├── auditLog.js    — non-blocking fire-and-forget audit log writer
+│   ├── migrate.js     — idempotent CREATE TABLE IF NOT EXISTS for all 5 tables
+│   └── seed.js        — inserts default subjects + demo principal/teacher accounts
+├── app.js             — Express app, CORS, body parsers, rate limiter, route mounting,
+│                        error handler wiring
+└── server.js          — entry point: DB connect → migrate → Redis connect → listen
+
+
+9. MIDDLEWARE USAGE
+--------------------
+Request lifecycle — protected route example (PATCH /content/:id/approve):
+
+  [incoming request]
+       ↓
+  generalLimiter          — 100 req / 15 min per IP; returns 429 if exceeded
+       ↓
+  authenticate            — verifies JWT, fetches user from DB, sets req.user
+       ↓
+  principalOnly           — checks req.user.role === 'principal'; 403 if not
+       ↓
+  approveContentValidator — express-validator checks :id param; 422 if invalid
+       ↓
+  ContentController.approveContent
+       ↓
+  [response sent]         — or →  errorHandler (catches thrown errors, maps to HTTP codes)
+
+Rate limiter tiers:
+  authLimiter            — 10 req / 15 min  (POST /auth/login, /auth/register)
+  generalLimiter         — 100 req / 15 min (all /api/* routes)
+  publicBroadcastLimiter — 200 req / 15 min (GET /content/live/:teacher)
+
+  The public broadcast limiter is intentionally higher because hundreds of students
+  may poll it simultaneously. Redis caching reduces the actual DB work even further.
+
+
+10. SCALABILITY APPROACH
+--------------------------
+Current implementation:
+
+  Stateless auth:
+    JWT requires no server-side session store. Any number of Node processes behind
+    a load balancer can verify the same token independently.
+
+  Connection pooling:
+    mysql2 pool (10 connections) prevents connection exhaustion under concurrent load.
+
+  Indexed queries:
+    All frequently filtered columns (status, subject, uploaded_by, start/end time)
+    are indexed. The live-content query uses a composite (start_time, end_time) index.
+
+  Redis cache (implemented):
+    /content/live/:teacher is cached with slot-boundary TTL. Under 1000 students
+    polling every 10 seconds, only 1 DB query fires per slot change instead of 1000.
+    Cache is per-teacher and per-subject for fine-grained invalidation.
+
+  Cloudinary CDN:
+    File delivery is fully offloaded to Cloudinary's global CDN. The Node server
+    never serves binary file data directly.
+
+Next-step improvements:
+
+  Cache warm-up:
+    On server start (or after invalidation), pre-populate cache for all active teachers
+    by calling getLiveContent() in the background. Students hit cache from the first request.
+
+  Message queues (Bull + Redis):
+    - Email/push notifications to teachers on approve/reject (currently synchronous audit log only).
+    - Scheduled jobs to deactivate content whose end_time has passed.
+    - Async Cloudinary cleanup queue for deleted content (currently inline, non-blocking).
+
+  Read replicas:
+    Separate MySQL read replica for SELECT-heavy paths (content listing, live broadcast fallback).
+    Write operations (uploads, approvals) continue to hit the primary.
+
+  API versioning:
+    Add /api/v1/ prefix now to allow non-breaking evolution. Current routes would become
+    /api/v1/content/live/:teacher, etc.
+
+  WebSocket / SSE:
+    Replace student polling with Server-Sent Events on /content/live/:teacher.
+    Server pushes a new event at each slot boundary instead of clients hammering the API.
+    Reduces HTTP overhead drastically at scale.
+
+  Reverse proxy (Nginx):
+    SSL termination, gzip compression, static asset caching, and upstream connection
+    keepalive before traffic reaches Node. Also handles rate limiting at the edge.
+
+  Horizontal scaling:
+    Because auth is stateless (JWT) and broadcast state is in Redis + MySQL (not in
+    Node memory), multiple Node instances can run behind a load balancer with no
+    sticky sessions required.
+
+========================================================
