@@ -51,7 +51,7 @@ class ContentService {
       duration: parseInt(rotation_duration) || 5,
     });
 
-    const liveUrl = `${process.env.BASE_URL}/live/${userId}`;
+    const liveUrl = `${process.env.BASE_URL}/api/content/live/${userId}`;
 
     return {
       ...content,
